@@ -1,90 +1,82 @@
+import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 
-# === 实验数据 (来自你的日志) ===
-models = ['ResNet50', 'MobileNetV2', 'ViT', 'Llama']
+# 设置绘图风格
+sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
 
-# 数据格式: [Rank0, Rank1, Rank2, Rank3] (单位 ms)
-baseline_lats = {
-    'ResNet50': [7.02, 6.96, 6.47, 5.82],
-    'MobileNetV2': [3.48, 2.81, 1.87, 1.65],
-    'ViT': [5.55, 7.23, 7.20, 0.11],
-    'Llama': [2.91, 2.70, 2.68, 2.48]
+# 读取数据
+df = pd.read_csv('experiment_results.csv')
+
+# 定义四个关键指标
+metrics = [
+    'Cycle Time (ms)', 
+    'Total Latency (ms)', 
+    'Bubble Rate (%)', 
+    'Throughput (img/s)'
+]
+
+# 定义算法颜色映射，保证所有图中颜色一致
+# 您可以根据论文配色方案修改这里
+palette = {
+    'baseline': '#95a5a6',  # 灰色
+    'scdp': '#3498db',      # 蓝色
+    'optimal': '#e74c3c'    # 红色
 }
 
-scdp_lats = {
-    'ResNet50': [6.93, 6.75, 6.47, 6.25],
-    'MobileNetV2': [3.30, 2.84, 1.81, 1.86],
-    'ViT': [5.55, 4.72, 4.58, 4.89],
-    'Llama': [2.42, 2.45, 2.85, 3.15]
-}
+# 获取所有模型列表
+models = df['Model'].unique()
 
-# 吞吐量数据 (img/s)
-baseline_thr = [4561.40, 9201.28, 4426.08, 10980.48]
-scdp_thr = [4614.60, 9707.74, 5767.08, 10174.33]
-
-def plot_latency_breakdown():
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    fig.suptitle('Load Balance Analysis: Latency per Rank (Lower Variance is Better)', fontsize=16)
+for model in models:
+    # 筛选当前模型的数据
+    model_data = df[df['Model'] == model]
     
-    ranks = ['R0', 'R1', 'R2', 'R3']
-    x = np.arange(len(ranks))
-    width = 0.35
+    # 创建 2x2 子图
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Performance Metrics for {model}', fontsize=16, fontweight='bold', y=1.02)
     
-    for idx, model in enumerate(models):
-        ax = axes[idx//2, idx%2]
+    # 扁平化 axes 方便遍历
+    axes = axes.flatten()
+    
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
         
-        rects1 = ax.bar(x - width/2, baseline_lats[model], width, label='Baseline', color='#d62728', alpha=0.7)
-        rects2 = ax.bar(x + width/2, scdp_lats[model], width, label='SCDP (Ours)', color='#1f77b4', alpha=0.8)
+        # 绘制柱状图
+        sns.barplot(
+            data=model_data, 
+            x='Algorithm', 
+            y=metric, 
+            hue='Algorithm', 
+            palette=palette, 
+            ax=ax,
+            edgecolor='black', # 给柱子加黑边，适合黑白打印
+            dodge=False # 不需要偏移，因为x轴就是分类依据
+        )
         
-        ax.set_title(model)
-        ax.set_ylabel('Latency (ms)')
-        ax.set_xticks(x)
-        ax.set_xticklabels(ranks)
-        if idx == 0: ax.legend()
+        # 优化标签和标题
+        ax.set_title(metric, fontsize=14)
+        ax.set_xlabel('')
+        ax.set_ylabel(metric)
         
-        # Add Cycle Time Line (Max Latency) representing the bottleneck
-        max_base = max(baseline_lats[model])
-        max_scdp = max(scdp_lats[model])
-        ax.axhline(y=max_base, color='#d62728', linestyle='--', linewidth=1, alpha=0.5)
-        ax.axhline(y=max_scdp, color='#1f77b4', linestyle='--', linewidth=1, alpha=0.5)
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig('exp_latency_breakdown.png', dpi=300)
-    print("Saved exp_latency_breakdown.png")
-
-def plot_throughput_speedup():
-    fig, ax = plt.subplots(figsize=(8, 6))
-    
-    x = np.arange(len(models))
-    width = 0.35
-    
-    # Calculate Speedup
-    speedup = [s/b for s, b in zip(scdp_thr, baseline_thr)]
-    
-    # Plot bars
-    bars = ax.bar(x, speedup, width=0.5, color=['#2ca02c' if s > 1 else 'gray' for s in speedup], alpha=0.8)
-    
-    # Baseline line
-    ax.axhline(y=1.0, color='black', linestyle='--', linewidth=1.5, label='Baseline')
-    
-    ax.set_ylabel('Normalized Throughput (vs Baseline)')
-    ax.set_title('Throughput Improvement of SCDP')
-    ax.set_xticks(x)
-    ax.set_xticklabels(models)
-    ax.set_ylim(0.8, 1.4)
-    
-    # Add labels
-    for bar, val in zip(bars, speedup):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height,
-                f'{val:.2f}x',
-                ha='center', va='bottom', fontsize=12, fontweight='bold')
+        # 在柱子上标注数值
+        for container in ax.containers:
+            ax.bar_label(container, fmt='%.2f', padding=3, fontsize=11)
+            
+        # 移除图例（因为x轴已经很清楚了）
+        # 安全地移除图例：如果图例存在才移除
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        
+        # 微调Y轴范围，让柱子不要顶到头
+        ylim = ax.get_ylim()
+        ax.set_ylim(ylim[0], ylim[1] * 1.15)
 
     plt.tight_layout()
-    plt.savefig('exp_throughput_speedup.png', dpi=300)
-    print("Saved exp_throughput_speedup.png")
-
-if __name__ == "__main__":
-    plot_latency_breakdown()
-    plot_throughput_speedup()
+    
+    # 保存图片
+    filename = f'{model}_performance.png'
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"Graph saved: {filename}")
+    
+    plt.show() # 如果在 notebook 中运行，这行会显示图片
