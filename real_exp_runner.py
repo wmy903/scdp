@@ -13,7 +13,7 @@ from runtime_utils import get_model_and_input, PipelineStage, profile_model
 # === Configuration ===
 WORLD_SIZE = 4
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '29606'
+os.environ['MASTER_PORT'] = '29607' # Increment port
 
 # === NCCL Settings ===
 os.environ["NCCL_P2P_DISABLE"] = "1"
@@ -27,7 +27,6 @@ def profile_worker(model_name, output_queue):
         device = "cuda:0"
         model, sample_input = get_model_and_input(model_name)
         
-        # Adjust batch for accurate profiling
         BATCH_SIZE = 32
         if sample_input.dtype == torch.long:
             sample_input = sample_input.repeat(BATCH_SIZE, 1)
@@ -69,19 +68,13 @@ def run_worker_metrics(rank, world_size, partition_plan, node_shapes, model_name
             else: real_inputs = [dummy.repeat(BATCH_SIZE, 1, 1, 1).to(device)]
         else:
             for name in input_names:
-                # [FIX] Smarter Fallback Logic
                 if name in node_shapes:
                     shape = list(node_shapes[name])
                     shape[0] = BATCH_SIZE
                     shape = tuple(shape)
                 else:
-                    # Fallback if shape missing
-                    if 'llama' in model_name:
-                        # Llama typical inter-layer shape: (Batch, Seq, Hidden)
-                        shape = (BATCH_SIZE, 64, 512) 
-                    else:
-                        # Vision typical
-                        shape = (BATCH_SIZE, 64, 56, 56)
+                    if 'llama' in model_name: shape = (BATCH_SIZE, 64, 512) 
+                    else: shape = (BATCH_SIZE, 64, 56, 56)
                 
                 if 'llama' in model_name and 'ids' in name:
                      real_inputs.append(torch.randint(0, 100, shape, device=device))
@@ -136,6 +129,8 @@ def run_experiment(model_name, algo):
 
     if algo == 'scdp':
         plan = partitioner.run_scdp(profile_data=real_costs)
+    elif algo == 'optimal':
+        plan = partitioner.run_optimal(profile_data=real_costs)
     else:
         plan = partitioner.run_baseline(profile_data=real_costs)
         
@@ -160,8 +155,8 @@ def run_experiment(model_name, algo):
     lats = [return_dict[r] * 1000 for r in range(WORLD_SIZE)]
     cycle = max(lats)
     total = sum(lats)
-    bubble = (cycle * WORLD_SIZE - total) / (cycle * WORLD_SIZE)
-    thr = 1000.0 / cycle * 32
+    bubble = (cycle * WORLD_SIZE - total) / (cycle * WORLD_SIZE) if cycle > 0 else 0
+    thr = 1000.0 / cycle * 32 if cycle > 0 else 0
     
     print(f"    Latencies: {[f'{x:.2f}ms' for x in lats]}")
     print(f"    Cycle Time: {cycle:.2f} ms")
@@ -170,13 +165,15 @@ def run_experiment(model_name, algo):
 
 def main():
     models = ['resnet50', 'mobilenet_v2', 'vit', 'llama']
-    algos = ['baseline', 'scdp']
+    # Added 'optimal' to the list
+    algos = ['baseline', 'scdp', 'optimal']
     
+    print("Starting Experiments with Oracle Profiling & Optimal Baseline...")
     for m in models:
         for a in algos:
             try:
                 run_experiment(m, a)
-                time.sleep(3)
+                time.sleep(2)
             except Exception as e:
                 print(f"Error: {e}")
 
