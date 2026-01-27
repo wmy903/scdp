@@ -4,6 +4,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 import numpy as np
+import pandas as pd  # 新增 pandas 用于保存 CSV
 from datetime import timedelta
 from torch.fx.passes.shape_prop import ShapeProp
 
@@ -13,13 +14,41 @@ from runtime_utils import get_model_and_input, PipelineStage, profile_model
 # === Configuration ===
 WORLD_SIZE = 4
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '29607' # Increment port
+os.environ['MASTER_PORT'] = '29608' # Port incremented to avoid conflict
 
 # === NCCL Settings ===
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_SHM_DISABLE"] = "1"
 os.environ["NCCL_NET_GDR_LEVEL"] = "0"
+
+# === Logger for saving results ===
+class ExperimentLogger:
+    def __init__(self, filename="experiment_results.csv"):
+        self.filename = filename
+        self.results = []
+
+    def log(self, model, algo, plan, latencies, cycle_time, total_latency, bubble_rate, throughput):
+        entry = {
+            "Model": model,
+            "Algorithm": algo,
+            "Cycle Time (ms)": round(cycle_time, 2),
+            "Total Latency (ms)": round(total_latency, 2),
+            "Bubble Rate (%)": round(bubble_rate * 100, 2),
+            "Throughput (img/s)": round(throughput, 2),
+            "Latencies (ms)": str([round(l, 2) for l in latencies]), # Save as string
+            "Partition Plan": str(plan)
+        }
+        self.results.append(entry)
+        print(f"    [Logger] Data recorded for {model}-{algo}")
+
+    def save(self):
+        df = pd.DataFrame(self.results)
+        df.to_csv(self.filename, index=False)
+        print(f"\n>>> Results saved to {self.filename}")
+
+# Global logger instance (will be passed to run_experiment)
+logger = ExperimentLogger()
 
 def profile_worker(model_name, output_queue):
     try:
@@ -134,7 +163,8 @@ def run_experiment(model_name, algo):
     else:
         plan = partitioner.run_baseline(profile_data=real_costs)
         
-    print(f"    Plan: {[len(plan[r]) for r in plan]}")
+    plan_summary = [len(plan[r]) for r in plan]
+    print(f"    Plan: {plan_summary}")
     
     # 3. Execution
     manager = mp.Manager()
@@ -147,7 +177,7 @@ def run_experiment(model_name, algo):
     
     for p in procs: p.join()
     
-    # 4. Metrics
+    # 4. Metrics & Logging
     if len(return_dict) < WORLD_SIZE:
         print("    Error: Missing data from some ranks.")
         return
@@ -162,13 +192,15 @@ def run_experiment(model_name, algo):
     print(f"    Cycle Time: {cycle:.2f} ms")
     print(f"    Bubble Rate: {bubble*100:.2f}%")
     print(f"    Throughput: {thr:.2f} img/s")
+    
+    # Save to global logger
+    logger.log(model_name, algo, plan_summary, lats, cycle, total, bubble, thr)
 
 def main():
     models = ['resnet50', 'mobilenet_v2', 'vit', 'llama']
-    # Added 'optimal' to the list
     algos = ['baseline', 'scdp', 'optimal']
     
-    print("Starting Experiments with Oracle Profiling & Optimal Baseline...")
+    print("Starting Experiments with Oracle Profiling & Data Logging...")
     for m in models:
         for a in algos:
             try:
@@ -176,6 +208,9 @@ def main():
                 time.sleep(2)
             except Exception as e:
                 print(f"Error: {e}")
+    
+    # Final Save
+    logger.save()
 
 if __name__ == "__main__":
     main()
