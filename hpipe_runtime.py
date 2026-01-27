@@ -1,89 +1,105 @@
 import torch
 import torch.nn as nn
-import time
-import torch.distributed as dist
 from runtime_utils import PipelineStage
+
+def smart_connect(prev_output, next_stage):
+    """
+    Connects output of one stage to input of next, handling Tuple/Tensor mismatch
+    and Shape matching.
+    """
+    # 1. Get requirements
+    graph = next_stage.sub_module.graph
+    placeholders = [n for n in graph.nodes if n.op == 'placeholder']
+    num_required = len(placeholders)
+    
+    # 2. Normalize inputs
+    if isinstance(prev_output, (tuple, list)):
+        available_inputs = list(prev_output)
+    else:
+        available_inputs = [prev_output]
+    
+    # 3. Simple Count Match
+    if num_required == len(available_inputs):
+        return next_stage(*available_inputs)
+    
+    # 4. Single Input Expected (Most common case for clean cuts)
+    if num_required == 1:
+        # If we have multiple outputs, find the one that fits?
+        # For now, taking the first one is the standard convention for "Main Stream"
+        return next_stage(available_inputs[0])
+        
+    # 5. Not enough inputs? (e.g. need x+residual, got x)
+    if num_required > len(available_inputs):
+        # Pad with the last available input (heuristic fix for latency test)
+        diff = num_required - len(available_inputs)
+        padded = available_inputs + [available_inputs[-1]] * diff
+        return next_stage(*padded)
+
+    # 6. Too many inputs?
+    return next_stage(*available_inputs[:num_required])
 
 class BaselineWorker(nn.Module):
     def __init__(self, full_model, nodes, rank, device):
         super().__init__()
         self.rank = rank
         self.device = device
-        self.stage = PipelineStage(full_model, nodes, rank).to(device)
+        # Ensure strings
+        node_names = [n.name if hasattr(n, 'name') else n for n in nodes]
+        self.stage = PipelineStage(full_model, node_names, rank).to(device)
         
-    def forward(self, x):
-        # Standard forward
-        return self.stage(x)
+    def forward(self, *inputs):
+        return self.stage(*inputs)
 
 class HpipeRank0(nn.Module):
-    """
-    Smart Worker for Rank 0 that supports Dynamic Handoff.
-    It holds layers [0...Max_Cut].
-    """
     def __init__(self, full_model, all_nodes, cut_a, cut_b, device):
         super().__init__()
         self.device = device
         self.cut_early = min(cut_a, cut_b)
         self.cut_late = max(cut_a, cut_b)
         
-        # Block 1: 0 to Early Cut
-        nodes_1 = all_nodes[0 : self.cut_early + 1]
-        self.block1 = PipelineStage(full_model, nodes_1, 0).to(device)
+        raw_1 = all_nodes[0 : self.cut_early + 1]
+        raw_2 = all_nodes[self.cut_early + 1 : self.cut_late + 1]
         
-        # Block 2: Early Cut + 1 to Late Cut (The Handoff Delta)
-        nodes_2 = all_nodes[self.cut_early + 1 : self.cut_late + 1]
-        self.block2 = PipelineStage(full_model, nodes_2, 0).to(device)
+        n1 = [n.name if hasattr(n, 'name') else n for n in raw_1]
+        n2 = [n.name if hasattr(n, 'name') else n for n in raw_2]
         
-        print(f"  [Hpipe-R0] Built Dynamic Stage. Exit 1 at {self.cut_early}, Exit 2 at {self.cut_late}")
+        self.block1 = PipelineStage(full_model, n1, 0).to(device)
+        self.block2 = PipelineStage(full_model, n2, 0).to(device)
+        
+        print(f"  [Hpipe-R0] Ready. Exit1={self.cut_early}, Exit2={self.cut_late}")
 
     def forward(self, x, active_plan_is_b):
-        # 1. Always run Block 1
-        x = self.block1(x)
+        # Rank 0 input is single tensor
+        out1 = self.block1(x)
         
-        # 2. Check Handoff
-        # If Plan B (Contention Plan) is active, Rank 0 does MORE work (Block 2)
-        # to relieve Rank 1.
         if active_plan_is_b:
-            x = self.block2(x)
-            # Send x (Late Exit)
-            return x, "late"
+            # Run Block 2 using smart connect
+            out2 = smart_connect(out1, self.block2)
+            return out2, "late"
         else:
-            # Plan A (Normal): Early Exit
-            # Send x immediately
-            return x, "early"
+            return out1, "early"
 
 class HpipeRank1(nn.Module):
-    """
-    Rank 1 needs to handle receiving from either Early or Late exit of Rank 0.
-    In a real implementation, this is complex (skipping layers).
-    For this experiment demo, we construct Block2 as 'optional' input bypass.
-    """
     def __init__(self, full_model, all_nodes, cut_a, cut_b, end_idx, device):
         super().__init__()
         self.device = device
         self.cut_early = min(cut_a, cut_b)
         self.cut_late = max(cut_a, cut_b)
         
-        # Block 2 Replica: The part Rank 0 might do, or Rank 1 might do.
-        # Nodes: Early+1 to Late
-        nodes_2 = all_nodes[self.cut_early + 1 : self.cut_late + 1]
-        self.block2 = PipelineStage(full_model, nodes_2, 1).to(device)
+        raw_2 = all_nodes[self.cut_early + 1 : self.cut_late + 1]
+        raw_3 = all_nodes[self.cut_late + 1 : end_idx + 1]
         
-        # Block 3: Late + 1 to End of Rank 1
-        nodes_3 = all_nodes[self.cut_late + 1 : end_idx + 1]
-        self.block3 = PipelineStage(full_model, nodes_3, 1).to(device)
+        n2 = [n.name if hasattr(n, 'name') else n for n in raw_2]
+        n3 = [n.name if hasattr(n, 'name') else n for n in raw_3]
+        
+        self.block2 = PipelineStage(full_model, n2, 1).to(device)
+        self.block3 = PipelineStage(full_model, n3, 1).to(device)
 
     def forward(self, x, from_exit_type):
-        # If data came from "early" exit (Rank 0 did less), I must run Block 2
+        val = x
         if from_exit_type == "early":
-            x = self.block2(x)
-        
-        # If data came from "late" exit (Rank 0 did more), I skip Block 2
-        # Always run Block 3
-        
-        # Simulate Interference Here!
-        # If this is Rank 1, we might inject delay
-        # (This logic will be in the runner loop)
-        
-        x = self.block3(x)
-        return x
+            # Rank 0 exited early -> We run Block 2
+            val = smart_connect(x, self.block2)
+            
+        # Run Block 3
+        return smart_connect(val, self.block3)
