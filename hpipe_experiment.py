@@ -12,33 +12,17 @@ from runtime_utils import get_model_and_input
 # === Config ===
 WORLD_SIZE = 4
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '29625' # Port bump
+os.environ['MASTER_PORT'] = '29630' # Port bump
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_SHM_DISABLE"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-OUTPUT_DIR = "hpipe_exp_results"
+OUTPUT_DIR = "hpipe_exp_results_v4"
 if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
 
-# [CRITICAL UPDATE] Dynamic Interference Logic
-def simulate_interference(rank, batch_idx, current_node_count, original_node_count):
-    """
-    Simulate 'Slowdown' (Multiplicative).
-    If Rank 1 is congested, it becomes X times slower per op.
-    So if we reduce ops (current_node_count), the delay reduces proportionally.
-    """
-    if rank == 1 and batch_idx > 50:
-        # Assume the hardware is 5x slower than normal due to interference
-        # Base penalty for full workload is ~100ms
-        # Scaled penalty = 100ms * (current_load / original_load)
-        
-        load_ratio = current_node_count / original_node_count if original_node_count > 0 else 1.0
-        penalty = 0.15 * load_ratio # 150ms penalty at full load
-        
-        time.sleep(penalty)
-
 def generate_smart_inputs(module_to_run, node_shapes, device, model_name, batch_size=32):
-    """Generate dummy inputs."""
+    # (Same as before)
     if hasattr(module_to_run, 'sub_module'): graph = module_to_run.sub_module.graph
     elif hasattr(module_to_run, 'graph'): graph = module_to_run.graph
     elif hasattr(module_to_run, 'stage'): graph = module_to_run.stage.sub_module.graph
@@ -77,10 +61,7 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
         full_model, _ = get_model_and_input(model_name)
         
         # --- Metrics for scaling interference ---
-        # We need to know how many nodes Rank 1 handles in Plan A (Full Load)
         r1_nodes_plan_a = len(plan_a[1])
-        
-        # Current worker setup
         worker = None
         current_node_count = 0
         
@@ -94,26 +75,34 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
             if rank == 0: worker = HpipeRank0(full_model, all_nodes, cut_a, cut_b, device)
             elif rank == 1: worker = HpipeRank1(full_model, all_nodes, cut_a, cut_b, end_r1, device)
             else: worker = BaselineWorker(full_model, plan_a[rank], rank, device)
-            # Initial node count (approximate for Hpipe)
             current_node_count = len(plan_a[rank])
 
         active_plan = torch.tensor([0], dtype=torch.long, device=device)
         latencies = []
-        memories = []
+        static_memories = [] # New Metric
+        
+        # For Adaptive Interference Calculation
+        warmup_latencies = []
+        base_penalty = 0.05 # Default fallback
         
         # --- Run Loop ---
         for i in range(100):
+            # 1. Measure Static Memory (Before Forward)
+            # This captures Weights + Context, ignoring Activations
+            torch.cuda.empty_cache() 
+            mem_stat = torch.cuda.memory_allocated(device) / (1024**2)
+            static_memories.append(mem_stat)
+
             t0 = time.time()
-            torch.cuda.reset_peak_memory_stats(device) 
             
             # --- Trigger Logic ---
             if i == 60:
-                if rank == 0: print(f"    [{mode.upper()}] Batch {i}: Reconfiguration Triggered...")
-                
+                if rank == 0: print(f"    [{mode.upper()}] Batch {i}: Reconfiguration...")
                 if mode == 'baseline':
-                    time.sleep(2.0) # Simulate Downtime
+                    # Simulate downtime + reload
+                    time.sleep(1.0) # Reduced from 2.0 to be kinder
                     worker = BaselineWorker(full_model, plan_b[rank], rank, device)
-                    current_node_count = len(plan_b[rank]) # Update load info
+                    current_node_count = len(plan_b[rank]) 
                     dist.barrier()
                 else:
                     if rank == 0: active_plan[0] = 1
@@ -122,15 +111,12 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
             # --- Execution Logic ---
             is_plan_b = (active_plan.item() == 1) or (mode=='baseline' and i >= 60)
             
-            # Update Hpipe dynamic load count for Rank 1
             if mode == 'hpipe' and rank == 1:
-                # Plan B for R1 is smaller than Plan A
                 current_node_count = len(plan_b[1]) if is_plan_b else len(plan_a[1])
 
             if rank == 0:
                 if 'llama' in model_name: inputs = [torch.randint(0, 1000, (32, 64), dtype=torch.long, device=device)]
                 else: inputs = [torch.randn(32, 3, 224, 224, device=device)]
-                
                 if mode == 'hpipe': worker(inputs[0], is_plan_b)
                 else: worker(*inputs)
                 
@@ -139,30 +125,40 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
                 target_block = worker.block3 if is_plan_b else worker.block2
                 inputs = generate_smart_inputs(target_block, node_shapes, device, model_name)
                 inp_arg = inputs[0] if len(inputs) == 1 else tuple(inputs)
-                
                 worker(inp_arg, exit_type)
                 
-                # [FIX] Apply Scaled Interference
-                simulate_interference(rank, i, current_node_count, r1_nodes_plan_a)
+                # [ADAPTIVE INTERFERENCE]
+                # Apply 4x slowdown based on observed base latency
+                if i > 50:
+                    load_ratio = current_node_count / r1_nodes_plan_a if r1_nodes_plan_a > 0 else 1.0
+                    real_penalty = base_penalty * 4.0 * load_ratio 
+                    time.sleep(real_penalty)
                 
             else:
                 target = worker.stage
                 inputs = generate_smart_inputs(target, node_shapes, device, model_name)
                 worker(*inputs)
-                if rank == 1: 
-                    simulate_interference(rank, i, current_node_count, r1_nodes_plan_a)
+                if rank == 1 and i > 50: 
+                    load_ratio = current_node_count / r1_nodes_plan_a if r1_nodes_plan_a > 0 else 1.0
+                    real_penalty = base_penalty * 4.0 * load_ratio 
+                    time.sleep(real_penalty)
 
             torch.cuda.synchronize()
             dist.barrier()
-            
             lat = time.time() - t0
-            mem = torch.cuda.max_memory_allocated(device) / (1024**2)
             latencies.append(lat)
-            memories.append(mem)
-        
+            
+            # Calibrate Base Penalty during warmup (Batch 10-40)
+            if 10 <= i < 40 and rank == 1:
+                warmup_latencies.append(lat)
+            if i == 40 and rank == 1 and warmup_latencies:
+                base_penalty = sum(warmup_latencies) / len(warmup_latencies)
+                # Cap minimum to avoid almost-zero sleep
+                if base_penalty < 0.005: base_penalty = 0.005
+
         if rank == 0:
             results_dict[f'{mode}_latency'] = latencies
-            results_dict[f'{mode}_memory'] = memories 
+            results_dict[f'{mode}_memory'] = static_memories 
             
         dist.destroy_process_group()
         
@@ -172,7 +168,7 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
         traceback.print_exc()
 
 def run_experiment_for_model(model_name):
-    print(f"\n=== Running Experiment: {model_name} ===")
+    print(f"\n=== Running Experiment v4: {model_name} ===")
     planner = HpipePlanner(model_name, WORLD_SIZE)
     plan_a, plan_b = planner.generate_plans()
     all_nodes = list(planner.partitioner.traced.graph.nodes) 
@@ -210,49 +206,16 @@ def run_experiment_for_model(model_name):
         })
         filename = f"{OUTPUT_DIR}/{model_name}_timeline.csv"
         df.to_csv(filename, index=False)
-        
-        # === [CRITICAL CHANGE] Calculate TOTAL Average (Including Spike) ===
-        # We start counting from batch 50 (when interference starts) to 100
-        # This covers the "Problem -> Reaction -> Recovery" lifecycle.
-        eval_window = list(range(50, 100))
-        
-        avg_lat_base = df.loc[eval_window, 'Baseline_Latency_s'].mean()
-        avg_lat_hpipe = df.loc[eval_window, 'Hpipe_Latency_s'].mean()
-        
-        # Throughput = N_Batches / Total_Time
-        total_time_base = df.loc[eval_window, 'Baseline_Latency_s'].sum()
-        total_time_hpipe = df.loc[eval_window, 'Hpipe_Latency_s'].sum()
-        
-        thr_base = len(eval_window) * 32 / total_time_base
-        thr_hpipe = len(eval_window) * 32 / total_time_hpipe
-        
-        reconfig_base = df.loc[60, 'Baseline_Latency_s']
-        reconfig_hpipe = df.loc[60, 'Hpipe_Latency_s']
-        max_mem_base = df['Baseline_Memory_MB'].max()
-        max_mem_hpipe = df['Hpipe_Memory_MB'].max()
-        
-        return {
-            'Model': model_name,
-            'Avg_Latency_Base': avg_lat_base, 'Avg_Latency_Hpipe': avg_lat_hpipe,
-            'Throughput_Base': thr_base,      'Throughput_Hpipe': thr_hpipe,
-            'Reconfig_Time_Base': reconfig_base, 'Reconfig_Time_Hpipe': reconfig_hpipe,
-            'Max_Mem_Base': max_mem_base,     'Max_Mem_Hpipe': max_mem_hpipe
-        }
+        print(f"Saved {filename}")
     return None
 
 def main():
     models = ['resnet50', 'mobilenet_v2', 'vit', 'llama']
-    summary_list = []
     for m in models:
         try:
-            metrics = run_experiment_for_model(m)
-            if metrics: summary_list.append(metrics)
+            run_experiment_for_model(m)
             time.sleep(2)
         except Exception as e: print(e)
-            
-    if summary_list:
-        pd.DataFrame(summary_list).to_csv(f"{OUTPUT_DIR}/summary_metrics.csv", index=False)
-        print("Done.")
 
 if __name__ == "__main__":
     main()
