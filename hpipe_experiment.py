@@ -12,7 +12,7 @@ from runtime_utils import get_model_and_input, PipelineStage
 # Config
 WORLD_SIZE = 4
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '29615' 
+os.environ['MASTER_PORT'] = '29616' 
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_SHM_DISABLE"] = "1"
@@ -23,19 +23,15 @@ def simulate_interference(rank, batch_idx, intensity_ms=100):
 
 def generate_smart_inputs(module_to_run, node_shapes, device, batch_size=32):
     """
-    Introspects the FX Graph of the module to find exactly what inputs (placeholders) are needed.
-    Lookups up the correct shape in node_shapes.
-    Returns a LIST of tensors.
+    Introspects the FX Graph to find required inputs.
     """
-    # module_to_run is likely a PipelineStage or a wrapper containing .sub_module
     if hasattr(module_to_run, 'sub_module'):
         graph = module_to_run.sub_module.graph
     elif hasattr(module_to_run, 'graph'):
         graph = module_to_run.graph
-    elif hasattr(module_to_run, 'stage'): # Handle BaselineWorker wrapper
+    elif hasattr(module_to_run, 'stage'): 
         graph = module_to_run.stage.sub_module.graph
     else:
-        # Fallback: Can't inspect
         return [torch.randn(batch_size, 3, 224, 224, device=device)]
 
     placeholders = [n for n in graph.nodes if n.op == 'placeholder']
@@ -44,21 +40,14 @@ def generate_smart_inputs(module_to_run, node_shapes, device, batch_size=32):
     for node in placeholders:
         name = node.name
         shape = None
-        
-        # 1. Try exact match in shape dictionary
         if name in node_shapes:
             shape = list(node_shapes[name])
-        # 2. Fallback for Input
         elif 'x' in name or 'input' in name: 
             shape = [batch_size, 3, 224, 224]
         else:
-            # Last resort fallback (should be rare with proper ShapeProp)
             shape = [batch_size, 256, 56, 56] 
             
-        # Ensure batch size matches
-        if shape[0] != batch_size:
-            shape[0] = batch_size
-            
+        if shape[0] != batch_size: shape[0] = batch_size
         inputs.append(torch.randn(*shape, device=device))
         
     return inputs
@@ -68,6 +57,10 @@ def run_baseline_scenario(rank, world_size, model_name, plan_a, plan_b, node_sha
         os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
         torch.cuda.set_device(0)
         device = torch.device("cuda:0")
+        
+        # Reset memory stats to track ONLY this process's usage
+        torch.cuda.reset_peak_memory_stats(device)
+        
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         
         full_model, _ = get_model_and_input(model_name)
@@ -75,7 +68,6 @@ def run_baseline_scenario(rank, world_size, model_name, plan_a, plan_b, node_sha
         # --- Phase 1: Deploy Plan A ---
         current_plan = plan_a
         worker = BaselineWorker(full_model, current_plan[rank], rank, device)
-        
         latencies = []
         
         for i in range(100):
@@ -84,7 +76,7 @@ def run_baseline_scenario(rank, world_size, model_name, plan_a, plan_b, node_sha
             # 1. Trigger Redeployment
             if i == 60:
                 if rank == 0: print(f"  [Baseline] Batch {i}: DETECTED SLOWDOWN. STOPPING Pipeline...")
-                time.sleep(2.0) # Simulate Overhead
+                time.sleep(2.0) 
                 
                 if rank == 0: print(f"  [Baseline] Batch {i}: Switching to Plan B...")
                 current_plan = plan_b
@@ -92,15 +84,11 @@ def run_baseline_scenario(rank, world_size, model_name, plan_a, plan_b, node_sha
                 dist.barrier()
             
             # 2. Execution
-            # [FIX] Always regenerate inputs based on current worker state
-            # This handles Rank 1 needing different inputs when Plan changes
             if rank == 0:
-                # Rank 0 always takes generic input (image)
                 inputs = [torch.randn(32, 3, 224, 224, device=device)]
                 if 'llama' in model_name: inputs = [torch.randint(0, 100, (32, 64), device=device)]
                 worker(*inputs)
             else:
-                # Other ranks simulate receiving data by generating dummy inputs that MATCH the stage requirements
                 inputs = generate_smart_inputs(worker.stage, node_shapes, device)
                 worker(*inputs)
                 simulate_interference(rank, i, intensity_ms=100)
@@ -109,6 +97,10 @@ def run_baseline_scenario(rank, world_size, model_name, plan_a, plan_b, node_sha
             dist.barrier()
             latencies.append(time.time() - t0)
             
+        # Record Peak Memory
+        peak_mem = torch.cuda.max_memory_allocated(device) / (1024**2) # MB
+        results_dict[f'baseline_mem_rank{rank}'] = peak_mem
+        
         if rank == 0: results_dict['baseline'] = latencies
         dist.destroy_process_group()
         
@@ -122,6 +114,9 @@ def run_hpipe_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes, 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
         torch.cuda.set_device(0)
         device = torch.device("cuda:0")
+        
+        torch.cuda.reset_peak_memory_stats(device)
+        
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         
         full_model, _ = get_model_and_input(model_name)
@@ -154,7 +149,6 @@ def run_hpipe_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes, 
             is_plan_b = (active_plan.item() == 1)
             
             if rank == 0:
-                # Rank 0 Input
                 inputs = [torch.randn(32, 3, 224, 224, device=device)]
                 if 'llama' in model_name: inputs = [torch.randint(0, 100, (32, 64), device=device)]
                 worker(inputs[0], is_plan_b)
@@ -162,22 +156,16 @@ def run_hpipe_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes, 
             elif rank == 1:
                 exit_type = "late" if is_plan_b else "early"
                 
-                # [FIX] Smartly generate inputs for the SPECIFIC block we are about to run
                 if is_plan_b:
-                    # Plan B: Rank 0 ran long, Rank 1 starts from Block 3
                     inputs = generate_smart_inputs(worker.block3, node_shapes, device)
                 else:
-                    # Plan A: Rank 0 ran short, Rank 1 starts from Block 2
                     inputs = generate_smart_inputs(worker.block2, node_shapes, device)
                 
-                # worker.forward expects 'x' (or tuple), plus exit_type
-                # Unpack list to tuple if multiple inputs
                 inp_arg = inputs[0] if len(inputs) == 1 else tuple(inputs)
                 worker(inp_arg, exit_type)
                 
                 simulate_interference(rank, i, intensity_ms=100)
             else:
-                # R2/R3
                 inputs = generate_smart_inputs(worker.stage, node_shapes, device)
                 worker(*inputs)
                 
@@ -185,6 +173,10 @@ def run_hpipe_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes, 
             dist.barrier()
             latencies.append(time.time() - t0)
             
+        # Record Peak Memory
+        peak_mem = torch.cuda.max_memory_allocated(device) / (1024**2) # MB
+        results_dict[f'hpipe_mem_rank{rank}'] = peak_mem
+        
         if rank == 0: results_dict['hpipe'] = latencies
         dist.destroy_process_group()
         
@@ -229,7 +221,7 @@ def main():
         procs.append(p)
     for p in procs: p.join()
     
-    # 4. Save
+    # 4. Save Latency Data
     if 'baseline' in results and 'hpipe' in results:
         df = pd.DataFrame({
             'Batch': range(100),
@@ -237,13 +229,33 @@ def main():
             'Hpipe': results['hpipe']
         })
         df.to_csv('hpipe_experiment_data.csv', index=False)
-        print("\nSuccess! Data saved to hpipe_experiment_data.csv")
+        print("\n[Data] Latency timeline saved to hpipe_experiment_data.csv")
         
         b = results['baseline']
         h = results['hpipe']
         print(f"Batch 60 (Switch): Base={b[60]*1000:.0f}ms, Hpipe={h[60]*1000:.0f}ms")
-    else:
-        print("Experiment failed (Results missing).")
+    
+    # 5. Save Memory Data
+    mem_data = []
+    print("\n[Memory Trade-off Analysis]")
+    for r in range(WORLD_SIZE):
+        base_mem = results.get(f'baseline_mem_rank{r}', 0)
+        hpipe_mem = results.get(f'hpipe_mem_rank{r}', 0)
+        diff = hpipe_mem - base_mem
+        pct = (diff / base_mem * 100) if base_mem > 0 else 0
+        
+        print(f"  Rank {r}: Baseline={base_mem:.1f}MB, Hpipe={hpipe_mem:.1f}MB, Overhead=+{diff:.1f}MB (+{pct:.1f}%)")
+        
+        mem_data.append({
+            'Rank': r,
+            'Baseline_MB': base_mem,
+            'Hpipe_MB': hpipe_mem,
+            'Overhead_MB': diff,
+            'Overhead_Pct': pct
+        })
+    
+    pd.DataFrame(mem_data).to_csv('hpipe_memory_stats.csv', index=False)
+    print("[Data] Memory stats saved to hpipe_memory_stats.csv")
 
 if __name__ == "__main__":
     main()
