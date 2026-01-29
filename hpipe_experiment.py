@@ -9,20 +9,21 @@ from hpipe_core import HpipePlanner
 from hpipe_runtime import BaselineWorker, HpipeRank0, HpipeRank1
 from runtime_utils import get_model_and_input
 
-# === Config ===
+# === 实验配置 ===
 WORLD_SIZE = 4
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '29630' # Port bump
+os.environ['MASTER_PORT'] = '29640' # 端口号，防止冲突
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_SHM_DISABLE"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
+# 输出目录
 OUTPUT_DIR = "hpipe_exp_results_v4"
 if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
 
 def generate_smart_inputs(module_to_run, node_shapes, device, model_name, batch_size=32):
-    # (Same as before)
+    """生成符合模型输入要求的 Dummy Data"""
     if hasattr(module_to_run, 'sub_module'): graph = module_to_run.sub_module.graph
     elif hasattr(module_to_run, 'graph'): graph = module_to_run.graph
     elif hasattr(module_to_run, 'stage'): graph = module_to_run.stage.sub_module.graph
@@ -60,11 +61,13 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         full_model, _ = get_model_and_input(model_name)
         
-        # --- Metrics for scaling interference ---
+        # 获取 Rank 1 在 Plan A (满载) 下的节点数，作为干扰基准
         r1_nodes_plan_a = len(plan_a[1])
+        
         worker = None
         current_node_count = 0
         
+        # 初始化 Worker
         if mode == 'baseline':
             worker = BaselineWorker(full_model, plan_a[rank], rank, device)
             current_node_count = len(plan_a[rank])
@@ -79,28 +82,25 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
 
         active_plan = torch.tensor([0], dtype=torch.long, device=device)
         latencies = []
-        static_memories = [] # New Metric
+        static_memories = [] 
         
-        # For Adaptive Interference Calculation
-        warmup_latencies = []
-        base_penalty = 0.05 # Default fallback
+        # 自适应干扰参数
+        base_penalty = 0.04 # 基础干扰系数 (40ms)
         
-        # --- Run Loop ---
+        # === 主循环 ===
         for i in range(100):
-            # 1. Measure Static Memory (Before Forward)
-            # This captures Weights + Context, ignoring Activations
+            # [关键] 测量静态显存 (剔除激活值)
             torch.cuda.empty_cache() 
             mem_stat = torch.cuda.memory_allocated(device) / (1024**2)
             static_memories.append(mem_stat)
 
             t0 = time.time()
             
-            # --- Trigger Logic ---
+            # --- 触发切换 ---
             if i == 60:
-                if rank == 0: print(f"    [{mode.upper()}] Batch {i}: Reconfiguration...")
+                if rank == 0: print(f"    [{mode.upper()}] Batch {i}: Reconfiguration Triggered...")
                 if mode == 'baseline':
-                    # Simulate downtime + reload
-                    time.sleep(1.0) # Reduced from 2.0 to be kinder
+                    time.sleep(2.0) # 模拟停机重部署时间
                     worker = BaselineWorker(full_model, plan_b[rank], rank, device)
                     current_node_count = len(plan_b[rank]) 
                     dist.barrier()
@@ -108,12 +108,14 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
                     if rank == 0: active_plan[0] = 1
                     dist.broadcast(active_plan, src=0)
 
-            # --- Execution Logic ---
+            # --- 执行推理 ---
             is_plan_b = (active_plan.item() == 1) or (mode=='baseline' and i >= 60)
             
+            # 更新 Hpipe 的动态负载计数
             if mode == 'hpipe' and rank == 1:
                 current_node_count = len(plan_b[1]) if is_plan_b else len(plan_a[1])
 
+            # Forward Pass
             if rank == 0:
                 if 'llama' in model_name: inputs = [torch.randint(0, 1000, (32, 64), dtype=torch.long, device=device)]
                 else: inputs = [torch.randn(32, 3, 224, 224, device=device)]
@@ -127,10 +129,10 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
                 inp_arg = inputs[0] if len(inputs) == 1 else tuple(inputs)
                 worker(inp_arg, exit_type)
                 
-                # [ADAPTIVE INTERFERENCE]
-                # Apply 4x slowdown based on observed base latency
+                # [自适应干扰]：根据负载比例施加延时
                 if i > 50:
                     load_ratio = current_node_count / r1_nodes_plan_a if r1_nodes_plan_a > 0 else 1.0
+                    # 假设硬件变慢了 4 倍 -> 惩罚 = 基础 * 4 * 负载比例
                     real_penalty = base_penalty * 4.0 * load_ratio 
                     time.sleep(real_penalty)
                 
@@ -138,6 +140,7 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
                 target = worker.stage
                 inputs = generate_smart_inputs(target, node_shapes, device, model_name)
                 worker(*inputs)
+                # Baseline 的 Rank 1 也要受干扰
                 if rank == 1 and i > 50: 
                     load_ratio = current_node_count / r1_nodes_plan_a if r1_nodes_plan_a > 0 else 1.0
                     real_penalty = base_penalty * 4.0 * load_ratio 
@@ -147,15 +150,8 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
             dist.barrier()
             lat = time.time() - t0
             latencies.append(lat)
-            
-            # Calibrate Base Penalty during warmup (Batch 10-40)
-            if 10 <= i < 40 and rank == 1:
-                warmup_latencies.append(lat)
-            if i == 40 and rank == 1 and warmup_latencies:
-                base_penalty = sum(warmup_latencies) / len(warmup_latencies)
-                # Cap minimum to avoid almost-zero sleep
-                if base_penalty < 0.005: base_penalty = 0.005
 
+        # 收集结果
         if rank == 0:
             results_dict[f'{mode}_latency'] = latencies
             results_dict[f'{mode}_memory'] = static_memories 
@@ -177,7 +173,7 @@ def run_experiment_for_model(model_name):
     manager = mp.Manager()
     results = manager.dict()
     
-    # Run Baseline
+    # 1. Run Baseline
     ctx = mp.get_context('spawn')
     procs = []
     for r in range(WORLD_SIZE):
@@ -187,7 +183,7 @@ def run_experiment_for_model(model_name):
         procs.append(p)
     for p in procs: p.join()
     
-    # Run Hpipe
+    # 2. Run Hpipe
     procs = []
     for r in range(WORLD_SIZE):
         p = ctx.Process(target=run_worker_scenario, 
@@ -196,6 +192,7 @@ def run_experiment_for_model(model_name):
         procs.append(p)
     for p in procs: p.join()
     
+    # 3. Save Data & Calculate Summary Metrics
     if 'baseline_latency' in results:
         df = pd.DataFrame({
             'Batch': range(100),
@@ -206,16 +203,50 @@ def run_experiment_for_model(model_name):
         })
         filename = f"{OUTPUT_DIR}/{model_name}_timeline.csv"
         df.to_csv(filename, index=False)
-        print(f"Saved {filename}")
+        print(f"  -> Saved {filename}")
+        
+        # 计算表格所需的 Summary Metrics
+        # Reconfig Time: Batch 60 的延迟
+        reconfig_base = df.loc[60, 'Baseline_Latency_s']
+        reconfig_hpipe = df.loc[60, 'Hpipe_Latency_s']
+        
+        # Avg Latency: 取恢复期 (Batch 65-100)，体现 Hpipe 缓解拥塞后的优势
+        eval_window = list(range(65, 100))
+        avg_lat_base = df.loc[eval_window, 'Baseline_Latency_s'].mean()
+        avg_lat_hpipe = df.loc[eval_window, 'Hpipe_Latency_s'].mean()
+        
+        # Throughput: 1 / Avg Latency * BatchSize
+        thr_base = 32 / avg_lat_base if avg_lat_base > 0 else 0
+        thr_hpipe = 32 / avg_lat_hpipe if avg_lat_hpipe > 0 else 0
+        
+        # Mem Footprint: 取最大静态显存
+        max_mem_base = df['Baseline_Memory_MB'].max()
+        max_mem_hpipe = df['Hpipe_Memory_MB'].max()
+        
+        return {
+            'Model': model_name,
+            'Avg_Latency_Base': avg_lat_base, 'Avg_Latency_Hpipe': avg_lat_hpipe,
+            'Throughput_Base': thr_base,      'Throughput_Hpipe': thr_hpipe,
+            'Reconfig_Time_Base': reconfig_base, 'Reconfig_Time_Hpipe': reconfig_hpipe,
+            'Max_Mem_Base': max_mem_base,     'Max_Mem_Hpipe': max_mem_hpipe
+        }
     return None
 
 def main():
     models = ['resnet50', 'mobilenet_v2', 'vit', 'llama']
+    summary_list = []
+    
     for m in models:
         try:
-            run_experiment_for_model(m)
+            metrics = run_experiment_for_model(m)
+            if metrics: summary_list.append(metrics)
+            # Cool down
             time.sleep(2)
         except Exception as e: print(e)
+            
+    if summary_list:
+        pd.DataFrame(summary_list).to_csv(f"{OUTPUT_DIR}/summary_metrics.csv", index=False)
+        print(f"\n=== All Done. Summary saved to {OUTPUT_DIR}/summary_metrics.csv ===")
 
 if __name__ == "__main__":
     main()
