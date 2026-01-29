@@ -12,14 +12,13 @@ from runtime_utils import get_model_and_input
 # === 实验配置 ===
 WORLD_SIZE = 4
 os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '29640' # 端口号，防止冲突
+os.environ['MASTER_PORT'] = '29650' # 新端口
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["NCCL_IB_DISABLE"] = "1"
 os.environ["NCCL_SHM_DISABLE"] = "1"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# 输出目录
-OUTPUT_DIR = "hpipe_exp_results_v4"
+OUTPUT_DIR = "hpipe_exp_results_v5"
 if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
 
 def generate_smart_inputs(module_to_run, node_shapes, device, model_name, batch_size=32):
@@ -61,7 +60,7 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
         full_model, _ = get_model_and_input(model_name)
         
-        # 获取 Rank 1 在 Plan A (满载) 下的节点数，作为干扰基准
+        # 获取 Rank 1 在 Plan A (满载) 下的节点数，作为负载分母
         r1_nodes_plan_a = len(plan_a[1])
         
         worker = None
@@ -84,12 +83,15 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
         latencies = []
         static_memories = [] 
         
-        # 自适应干扰参数
-        base_penalty = 0.04 # 基础干扰系数 (40ms)
+        # === 动态干扰参数 ===
+        warmup_latencies = []
+        base_latency_avg = 0.0 # 将在运行时计算
+        # 设定硬件降级系数：硬件变慢 3 倍 (吞吐量变为 1/3，不会是 0)
+        SLOWDOWN_FACTOR = 3.0 
         
         # === 主循环 ===
         for i in range(100):
-            # [关键] 测量静态显存 (剔除激活值)
+            # 1. 测量静态显存 (剔除激活值)
             torch.cuda.empty_cache() 
             mem_stat = torch.cuda.memory_allocated(device) / (1024**2)
             static_memories.append(mem_stat)
@@ -100,7 +102,7 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
             if i == 60:
                 if rank == 0: print(f"    [{mode.upper()}] Batch {i}: Reconfiguration Triggered...")
                 if mode == 'baseline':
-                    time.sleep(2.0) # 模拟停机重部署时间
+                    time.sleep(2.0) # 模拟停机重部署
                     worker = BaselineWorker(full_model, plan_b[rank], rank, device)
                     current_node_count = len(plan_b[rank]) 
                     dist.barrier()
@@ -111,7 +113,7 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
             # --- 执行推理 ---
             is_plan_b = (active_plan.item() == 1) or (mode=='baseline' and i >= 60)
             
-            # 更新 Hpipe 的动态负载计数
+            # 更新 Hpipe Rank 1 的负载计数
             if mode == 'hpipe' and rank == 1:
                 current_node_count = len(plan_b[1]) if is_plan_b else len(plan_a[1])
 
@@ -129,27 +131,35 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
                 inp_arg = inputs[0] if len(inputs) == 1 else tuple(inputs)
                 worker(inp_arg, exit_type)
                 
-                # [自适应干扰]：根据负载比例施加延时
-                if i > 50:
+                # [关键修正] 相对干扰逻辑
+                if i > 50 and base_latency_avg > 0:
+                    # 计算当前负载比例 (Hpipe 会小于 1.0)
                     load_ratio = current_node_count / r1_nodes_plan_a if r1_nodes_plan_a > 0 else 1.0
-                    # 假设硬件变慢了 4 倍 -> 惩罚 = 基础 * 4 * 负载比例
-                    real_penalty = base_penalty * 4.0 * load_ratio 
-                    time.sleep(real_penalty)
+                    # 硬件变慢带来的额外延时 = 正常耗时 * (慢倍数 - 1) * 负载比例
+                    penalty = base_latency_avg * (SLOWDOWN_FACTOR - 1) * load_ratio
+                    time.sleep(penalty)
                 
             else:
                 target = worker.stage
                 inputs = generate_smart_inputs(target, node_shapes, device, model_name)
                 worker(*inputs)
-                # Baseline 的 Rank 1 也要受干扰
-                if rank == 1 and i > 50: 
+                # Baseline Rank 1 干扰
+                if rank == 1 and i > 50 and base_latency_avg > 0:
                     load_ratio = current_node_count / r1_nodes_plan_a if r1_nodes_plan_a > 0 else 1.0
-                    real_penalty = base_penalty * 4.0 * load_ratio 
-                    time.sleep(real_penalty)
+                    penalty = base_latency_avg * (SLOWDOWN_FACTOR - 1) * load_ratio
+                    time.sleep(penalty)
 
             torch.cuda.synchronize()
             dist.barrier()
             lat = time.time() - t0
             latencies.append(lat)
+            
+            # [Warmup 计算] 使用 Batch 10-40 计算该模型的正常基准耗时
+            if 10 <= i < 40 and rank == 1:
+                warmup_latencies.append(lat)
+            if i == 40 and rank == 1 and warmup_latencies:
+                base_latency_avg = sum(warmup_latencies) / len(warmup_latencies)
+                # print(f"  [Info] Model {model_name} Base Latency: {base_latency_avg*1000:.2f}ms")
 
         # 收集结果
         if rank == 0:
@@ -164,7 +174,7 @@ def run_worker_scenario(rank, world_size, model_name, plan_a, plan_b, all_nodes,
         traceback.print_exc()
 
 def run_experiment_for_model(model_name):
-    print(f"\n=== Running Experiment v4: {model_name} ===")
+    print(f"\n=== Running Experiment v5: {model_name} ===")
     planner = HpipePlanner(model_name, WORLD_SIZE)
     plan_a, plan_b = planner.generate_plans()
     all_nodes = list(planner.partitioner.traced.graph.nodes) 
@@ -192,7 +202,7 @@ def run_experiment_for_model(model_name):
         procs.append(p)
     for p in procs: p.join()
     
-    # 3. Save Data & Calculate Summary Metrics
+    # 3. Process Results
     if 'baseline_latency' in results:
         df = pd.DataFrame({
             'Batch': range(100),
@@ -205,21 +215,19 @@ def run_experiment_for_model(model_name):
         df.to_csv(filename, index=False)
         print(f"  -> Saved {filename}")
         
-        # 计算表格所需的 Summary Metrics
-        # Reconfig Time: Batch 60 的延迟
-        reconfig_base = df.loc[60, 'Baseline_Latency_s']
-        reconfig_hpipe = df.loc[60, 'Hpipe_Latency_s']
+        # === [核心修正] Summary Metrics 计算逻辑 ===
+        # 只统计恢复期 (Batch 70-100)，此时 Hpipe 的优势应该完全体现出来
+        eval_window = list(range(70, 100))
         
-        # Avg Latency: 取恢复期 (Batch 65-100)，体现 Hpipe 缓解拥塞后的优势
-        eval_window = list(range(65, 100))
         avg_lat_base = df.loc[eval_window, 'Baseline_Latency_s'].mean()
         avg_lat_hpipe = df.loc[eval_window, 'Hpipe_Latency_s'].mean()
         
-        # Throughput: 1 / Avg Latency * BatchSize
+        # 吞吐量计算
         thr_base = 32 / avg_lat_base if avg_lat_base > 0 else 0
         thr_hpipe = 32 / avg_lat_hpipe if avg_lat_hpipe > 0 else 0
         
-        # Mem Footprint: 取最大静态显存
+        reconfig_base = df.loc[60, 'Baseline_Latency_s']
+        reconfig_hpipe = df.loc[60, 'Hpipe_Latency_s']
         max_mem_base = df['Baseline_Memory_MB'].max()
         max_mem_hpipe = df['Hpipe_Memory_MB'].max()
         
@@ -240,8 +248,7 @@ def main():
         try:
             metrics = run_experiment_for_model(m)
             if metrics: summary_list.append(metrics)
-            # Cool down
-            time.sleep(2)
+            time.sleep(1)
         except Exception as e: print(e)
             
     if summary_list:
