@@ -6,305 +6,190 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Set
 
-# === 1. Data Structures ===
-
 @dataclass
 class AlgoNode:
-    id: str
-    compute_cost: float = 0.0
-    memory_footprint: float = 0.0
-    contained_names: List[str] = field(default_factory=list)
-
+    id: str; compute_cost: float = 0.0; contained_names: List[str] = field(default_factory=list)
     def __post_init__(self):
-        if not self.contained_names:
-            self.contained_names = [self.id]
-
+        if not self.contained_names: self.contained_names = [self.id]
 @dataclass
-class AlgoEdge:
-    u: str
-    v: str
-    data_size: float = 0.0
+class AlgoEdge: u: str; v: str; tensor_bytes: float = 0.0 
 
 class AlgoGraph:
     def __init__(self):
-        self.nodes: Dict[str, AlgoNode] = {}
-        self.edges: Dict[Tuple[str, str], AlgoEdge] = {}
-        self.adj: Dict[str, List[str]] = {}
-        self.rev_adj: Dict[str, List[str]] = {}
-
-    def add_node(self, node: AlgoNode):
+        self.nodes = {}; self.edges = {}; self.adj = {}; self.rev_adj = {}
+    def add_node(self, node):
         self.nodes[node.id] = node
-        if node.id not in self.adj: self.adj[node.id] = []
-        if node.id not in self.rev_adj: self.rev_adj[node.id] = []
-
-    def add_edge(self, u: str, v: str, data_size: float):
-        if (u, v) in self.edges:
-            self.edges[(u, v)].data_size += data_size
-        else:
-            self.edges[(u, v)] = AlgoEdge(u, v, data_size)
-            self.adj[u].append(v)
-            self.rev_adj[v].append(u)
-
-    def remove_node(self, nid: str):
-        if nid not in self.nodes: return
-        for neighbor in list(self.adj[nid]):
-            del self.edges[(nid, neighbor)]
-            self.rev_adj[neighbor].remove(nid)
-        for source in list(self.rev_adj[nid]):
-            del self.edges[(source, nid)]
-            self.adj[source].remove(nid)
-        del self.nodes[nid]
-        del self.adj[nid]
-        del self.rev_adj[nid]
-
-    def to_networkx(self) -> nx.DiGraph:
-        G = nx.DiGraph()
-        for nid in self.nodes:
-            G.add_node(nid, weight=self.nodes[nid].compute_cost)
-        for (u, v), edge in self.edges.items():
-            G.add_edge(u, v, weight=edge.data_size)
-        return G
-
-# === 2. Coarsening (Heuristic for Scalability) ===
+        if node.id not in self.adj: self.adj[node.id] = set(); self.rev_adj[node.id] = set()
+    def remove_node(self, nid):
+        if nid in self.nodes:
+            del self.nodes[nid]; 
+            if nid in self.adj: del self.adj[nid]
+            if nid in self.rev_adj: del self.rev_adj[nid]
+    def add_edge(self, u, v, size_bytes):
+        if u not in self.nodes or v not in self.nodes: return
+        if (u, v) in self.edges: self.edges[(u, v)].tensor_bytes += size_bytes
+        else: self.edges[(u, v)] = AlgoEdge(u, v, size_bytes); self.adj[u].add(v); self.rev_adj[v].add(u)
+    def remove_edge(self, u, v):
+        if (u, v) in self.edges: del self.edges[(u, v)]
+        if u in self.adj: self.adj[u].discard(v)
+        if v in self.rev_adj: self.rev_adj[v].discard(u)
 
 class Coarsener:
-    def __init__(self, graph: AlgoGraph):
-        self.graph = copy.deepcopy(graph)
-
-    def check_cycle_after_merge(self, u: str, v: str) -> bool:
-        G = self.graph.to_networkx()
-        if G.has_edge(u, v): G.remove_edge(u, v)
-        return nx.has_path(G, u, v)
-
-    def merge_nodes(self, u: str, v: str):
-        node_u = self.graph.nodes[u]
-        node_v = self.graph.nodes[v]
-        node_u.compute_cost += node_v.compute_cost
-        node_u.memory_footprint = max(node_u.memory_footprint, node_v.memory_footprint)
-        node_u.contained_names.extend(node_v.contained_names)
-        
-        for neighbor in list(self.graph.adj[v]):
-            if neighbor == u: continue
-            data = self.graph.edges[(v, neighbor)].data_size
-            self.graph.add_edge(u, neighbor, data)
-        for source in list(self.graph.rev_adj[v]):
-            if source == u: continue
-            data = self.graph.edges[(source, v)].data_size
-            self.graph.add_edge(source, u, data)
-        self.graph.remove_node(v)
-
-    def coarsen(self, target_size: int) -> AlgoGraph:
-        max_rounds = 10
-        for _ in range(max_rounds):
-            if len(self.graph.nodes) <= target_size: break
-            edges = list(self.graph.edges.values())
-            edges.sort(key=lambda e: e.data_size, reverse=True)
-            merged_any = False
-            for edge in edges:
-                u, v = edge.u, edge.v
-                if not self.check_cycle_after_merge(u, v):
-                    self.merge_nodes(u, v)
-                    merged_any = True
-                    break 
-            if not merged_any: break
-        return self.graph
-
-# === 3. DP Partitioner (Exact Optimization) ===
+    def __init__(self, graph, profile, model_arch='cnn'):
+        self.graph = graph; self.profile = profile; self.model_arch = model_arch
+        self.total = sum(n.compute_cost for n in graph.nodes.values())
+    def coarsen(self, max_nodes=60, k_stages=4):
+        curr = copy.deepcopy(self.graph); ideal = self.total / k_stages
+        limit = ideal * 0.95 if self.model_arch == 'transformer' else ideal * 1.5 
+        changed = True
+        while changed:
+            changed = False
+            try:
+                g = nx.DiGraph(); 
+                for n in curr.nodes: g.add_node(n)
+                for u,v in curr.edges: g.add_edge(u,v)
+                topo = list(nx.topological_sort(g))
+            except: topo = list(curr.nodes.keys())
+            for i in range(len(topo)-1):
+                u = topo[i]; 
+                if u not in curr.nodes: continue
+                succs = list(curr.adj.get(u, []))
+                if len(succs)==1:
+                    v = succs[0]
+                    if v not in curr.nodes: continue
+                    preds = list(curr.rev_adj.get(v, []))
+                    if len(preds)==1 and preds[0]==u:
+                        if (curr.nodes[u].compute_cost + curr.nodes[v].compute_cost) < limit:
+                            self._merge(curr, u, v); changed = True
+        while len(curr.nodes) > max_nodes:
+            cands = list(curr.edges.values()); 
+            if not cands: break
+            cands.sort(key=lambda e: e.tensor_bytes, reverse=True)
+            merged = False
+            for e in cands:
+                if e.u not in curr.nodes or e.v not in curr.nodes: continue
+                if (curr.nodes[e.u].compute_cost + curr.nodes[e.v].compute_cost) < limit:
+                    self._merge(curr, e.u, e.v); merged = True; break
+            if not merged: break
+        return curr
+    def _merge(self, g, u, v):
+        un, vn = g.nodes[u], g.nodes[v]
+        un.compute_cost += vn.compute_cost; un.contained_names.extend(vn.contained_names)
+        for p in list(g.rev_adj[v]):
+            if p!=u and (p,v) in g.edges: 
+                w = g.edges[(p,v)].tensor_bytes; g.remove_edge(p,v); g.add_edge(p,u,w)
+        for s in list(g.adj[v]):
+            if s!=u and (v,s) in g.edges:
+                w = g.edges[(v,s)].tensor_bytes; g.remove_edge(v,s); g.add_edge(u,s,w)
+        g.remove_edge(u,v); g.remove_edge(v,u); g.remove_node(v)
 
 class DPPartitioner:
-    def __init__(self, graph: AlgoGraph, num_devices: int):
-        self.graph = graph
-        self.K = num_devices
-        
-        # Linearize graph
-        try:
-            self.topo_order = list(nx.topological_sort(self.graph.to_networkx()))
-        except:
-            self.topo_order = list(self.graph.nodes.keys())
-        
-        self.nodes = [self.graph.nodes[nid] for nid in self.topo_order]
-        self.M = len(self.nodes)
-        
-        # Pre-compute prefix sums for compute cost
-        self.prefix_comp = [0.0] * (self.M + 1)
-        for i in range(self.M):
-            self.prefix_comp[i+1] = self.prefix_comp[i] + self.nodes[i].compute_cost
-
-    def get_communication_cost(self, start_idx: int, end_idx: int) -> float:
-        """
-        Calculate precise communication cost for a stage covering nodes[start_idx:end_idx].
-        Comm Cost = Sum of data sizes of edges going OUT of this stage.
-        """
-        # Bandwidth constant (ms / MB)
-        # Assuming PCIe/NVLink ~10GB/s effective => 0.1 ms/MB
-        # Tuning this is important. Let's assume a fast interconnect.
-        BETA = 0.05 
-        
-        stage_nodes = set(self.topo_order[i] for i in range(start_idx, end_idx))
-        total_data = 0.0
-        
-        for u_id in stage_nodes:
-            # Check outgoing edges
-            if u_id in self.graph.adj:
-                for v_id in self.graph.adj[u_id]:
-                    # If v is NOT in this stage, it's a cut edge
-                    if v_id not in stage_nodes:
-                        total_data += self.graph.edges[(u_id, v_id)].data_size
-        
-        return total_data * BETA
-
+    def __init__(self, graph, k):
+        self.graph = graph; self.K = k; self.sorted_nodes = self._topo()
+        self.comm_beta = 1.0 / (10 * 1024**3 / 1000.0)
+    def _topo(self):
+        g = nx.DiGraph(); 
+        for n in self.graph.nodes: g.add_node(n)
+        for u,v in self.graph.edges: g.add_edge(u,v)
+        try: return list(nx.topological_sort(g))
+        except: return list(self.graph.nodes.keys())
     def solve(self):
-        # dp[k][i] = min max_latency using k devices for first i blocks
-        dp = np.full((self.K, self.M + 1), float('inf'))
-        split = np.zeros((self.K, self.M + 1), dtype=int)
-        
-        # --- Initialization (Device 0) ---
-        for i in range(1, self.M + 1):
-            comp = self.prefix_comp[i]
-            # Device 0 always sends data out if i < M
-            comm = self.get_communication_cost(0, i) if i < self.M else 0
-            dp[0][i] = comp + comm
+        N = len(self.sorted_nodes); K = self.K
+        nodes = [self.graph.nodes[n] for n in self.sorted_nodes]
+        pre = [0.0]*(N+1)
+        for i in range(N): pre[i+1] = pre[i] + nodes[i].compute_cost
+        comm_costs = [0.0]*N
+        for i in range(N-1):
+            u, v = nodes[i].id, nodes[i+1].id
+            if (u,v) in self.graph.edges: comm_costs[i] = self.graph.edges[(u,v)].tensor_bytes * self.comm_beta
+        def get_cost(s, e):
+            return (pre[e] - pre[s]) + (comm_costs[e-1] if e < N else 0.0)
+        dp = np.full((K+1, N+1), float('inf')); par = np.zeros((K+1, N+1), dtype=int); dp[0][0] = 0
+        for k in range(1, K+1):
+            for i in range(1, N+1):
+                for j in range(i):
+                    val = max(dp[k-1][j], get_cost(j, i))
+                    if val < dp[k][i]: dp[k][i] = val; par[k][i] = j
+        plan = {r:[] for r in range(K)}; stats = {r:{} for r in range(K)}; curr = N
+        for k in range(K, 0, -1):
+            prev = par[k][curr]
+            stats[k-1] = {'compute': pre[curr]-pre[prev], 'comm': comm_costs[curr-1] if curr < N else 0.0}
+            for idx in range(prev, curr): plan[k-1].extend(nodes[idx].contained_names)
+            curr = prev
+        return plan, stats
 
-        # --- DP Loop ---
-        for k in range(1, self.K):
-            for i in range(1, self.M + 1):
-                # Try all valid split points j
-                # Rank k takes nodes [j, i)
-                start_search = k # Ensure at least 1 node per previous rank
-                end_search = i   # Ensure at least 1 node for current rank
-                
-                for j in range(start_search, end_search):
-                    prev_max = dp[k-1][j]
-                    if prev_max == float('inf'): continue
-                    
-                    # Current stage cost
-                    curr_comp = self.prefix_comp[i] - self.prefix_comp[j]
-                    
-                    # Comm cost is 0 for the last device (Pipeline Sink)
-                    is_last_stage = (k == self.K - 1) and (i == self.M)
-                    curr_comm = 0.0 if is_last_stage else self.get_communication_cost(j, i)
-                    
-                    curr_latency = curr_comp + curr_comm
-                    bottleneck = max(prev_max, curr_latency)
-                    
-                    if bottleneck < dp[k][i]:
-                        dp[k][i] = bottleneck
-                        split[k][i] = j
+class AdapipePartitioner:
+    def __init__(self, m, p, d):
+        self.nodes=[n.name for n in m.graph.nodes if n.op in ['call_module','call_function','call_method']]
+        self.costs=[p.get(n,0.0) for n in self.nodes]; self.d=d
+    def solve(self):
+        l,h=max(self.costs) if self.costs else 0, sum(self.costs)
+        cuts=[]; 
+        for _ in range(30):
+            t=(l+h)/2; s=0; st=1; c=[]; ok=True
+            for i,v in enumerate(self.costs):
+                if s+v>t: st+=1; s=v; c.append(i); 
+                else: s+=v
+                if st>self.d: ok=False; break
+            if ok: cuts=c; h=t
+            else: l=t
+        b=[0]+cuts+[len(self.nodes)]; 
+        while len(b)<self.d+1: b.insert(-1, b[-1])
+        return {r: self.nodes[b[r]:b[r+1]] for r in range(self.d)}, None
 
-        # --- Backtrack ---
-        partition_map = {} 
-        curr = self.M
-        for k in range(self.K - 1, -1, -1):
-            start = split[k][curr]
-            names = []
-            for node in self.nodes[start:curr]:
-                names.extend(node.contained_names)
-            partition_map[k] = names
-            curr = start
-            
-        return partition_map
+class DagPPartitioner:
+    def __init__(self, m, p, d):
+        self.nodes=[n.name for n in m.graph.nodes if n.op in ['call_module','call_function','call_method']]
+        self.costs=[p.get(n,0.0) for n in self.nodes]; self.d=d
+    def solve(self):
+        tgt=sum(self.costs)/self.d; plan={i:[] for i in range(self.d)}; r,s=0,0.0
+        for n,c in zip(self.nodes, self.costs):
+            if s+c>tgt and r<self.d-1: r+=1; s=0.0
+            plan[r].append(n); s+=c
+        return plan, None
 
-# === 4. Partitioning Interface ===
+class PicoPartitioner:
+    def __init__(self, m, p, d):
+        self.nodes=[n.name for n in m.graph.nodes if n.op in ['call_module','call_function','call_method']]
+        self.costs=[p.get(n,0.0) for n in self.nodes]; self.d=d
+    def _rec(self, s, e, k):
+        if k==1: return [e]
+        if (e-s) < k: return list(range(s+1, s+k+1))
+        tot=sum(self.costs[s:e]); tgt=tot*(k//2/k); cur=0; spl=e; md=float('inf')
+        for i in range(s,e):
+            cur+=self.costs[i]; d=abs(cur-tgt)
+            if d<md: md=d; spl=i+1
+            else: break
+        return self._rec(s, spl, k//2) + self._rec(spl, e, k-k//2)
+    def solve(self):
+        c=self._rec(0, len(self.nodes), self.d); b=sorted(list(set([0]+c)))
+        while len(b)<self.d+1: b.append(b[-1])
+        return {r: self.nodes[b[r]:b[r+1]] for r in range(self.d)}, None
 
 class GraphPartitioner:
-    def __init__(self, model: torch.nn.Module, num_devices=4):
-        self.model = model
-        self.devices = num_devices
-        self.traced = torch.fx.symbolic_trace(model)
-        
-    def _get_cost(self, node: torch.fx.Node, profile_data: Dict[str, float] = None) -> float:
-        # 1. Oracle Data
-        if profile_data and node.name in profile_data:
-            return profile_data[node.name]
-        
-        # 2. Heuristic Fallback
-        if 'tensor_meta' not in node.meta: return 0.001
-        meta = node.meta['tensor_meta']
-        if not hasattr(meta, 'shape'): return 0.001
-        out_shape = list(meta.shape)
-        if not out_shape: return 0.001
-        out_shape[0] = 32
-        
-        num_elements = np.prod(out_shape)
-        # Simple FLOPs proxy
-        compute_ops = 0.0
-        if node.op == 'call_module': compute_ops = num_elements * 100 
-        elif node.op == 'call_function' and 'matmul' in str(node.target): compute_ops = num_elements * 128
-        
-        return (compute_ops / 20e9) + 0.01
-
-    def _build_graph(self, profile_data):
-        g = AlgoGraph()
-        for node in self.traced.graph.nodes:
-            cost = self._get_cost(node, profile_data)
-            dsize = 0.0
-            if 'tensor_meta' in node.meta and hasattr(node.meta['tensor_meta'], 'shape'):
-                # MB size
-                dsize = np.prod(node.meta['tensor_meta'].shape) * 4 / (1024**2) 
-            g.add_node(AlgoNode(node.name, cost, dsize))
-            
-        for node in self.traced.graph.nodes:
-            for user in node.users:
-                dsize = g.nodes[node.name].memory_footprint
-                g.add_edge(node.name, user.name, dsize)
+    def __init__(self, m, p, d, batch_size=32): 
+        self.traced=torch.fx.symbolic_trace(m); self.profile_data=p; self.devices=d; self.bs=batch_size
+    def _build(self):
+        g=AlgoGraph(); valid=['call_module','call_function','call_method']
+        for n in self.traced.graph.nodes:
+            if n.op in valid:
+                # [Fix] No scaling needed, profile data is already correct
+                g.add_node(AlgoNode(n.name, compute_cost=self.profile_data.get(n.name,0.0)))
+        for n in self.traced.graph.nodes:
+            if n.op in valid:
+                sz=0.0; tm=n.meta.get('tensor_meta')
+                if tm and hasattr(tm, 'shape'): 
+                    s=list(tm.shape); 
+                    if s: s[0]=self.bs
+                    sz=np.prod(s)*4.0
+                elif tm and isinstance(tm,(tuple,list)) and len(tm)>0 and hasattr(tm[0],'shape'):
+                    s=list(tm[0].shape); 
+                    if s: s[0]=self.bs
+                    sz=np.prod(s)*4.0
+                for u in n.users:
+                    if u.op in valid: g.add_edge(n.name, u.name, sz)
         return g
-
-    def run_optimal(self, profile_data: Dict[str, float] = None):
-        """
-        [New] Optimal Partitioning Algorithm.
-        Directly runs DP on the full, un-coarsened graph with precise costs.
-        """
-        raw_graph = self._build_graph(profile_data)
-        # Skip coarsening, run DP directly
-        partitioner = DPPartitioner(raw_graph, self.devices)
-        return partitioner.solve()
-
-    def run_scdp(self, profile_data: Dict[str, float] = None):
-        """
-        SCDP: Coarsening + DP.
-        Scalable approach for very large graphs.
-        """
-        raw_graph = self._build_graph(profile_data)
-        
-        # Skip coarsening if graph is small (optimization)
-        if len(raw_graph.nodes) < 500:
-            coarsened = raw_graph
-        else:
-            coarsener = Coarsener(raw_graph)
-            coarsened = coarsener.coarsen(target_size=self.devices * 8)
-        
-        partitioner = DPPartitioner(coarsened, self.devices)
-        return partitioner.solve()
-
-    def run_baseline(self, profile_data: Dict[str, float] = None):
-        """Greedy Baseline"""
-        nodes_cost = []
-        total_cost = 0.0
-        
-        for node in self.traced.graph.nodes:
-            if node.op in ['call_module', 'call_function', 'call_method']:
-                c = self._get_cost(node, profile_data)
-                nodes_cost.append((node.name, c))
-                total_cost += c
-        
-        avg_cost = total_cost / self.devices
-        partition_map = {i: [] for i in range(self.devices)}
-        curr_rank = 0
-        curr_sum = 0.0
-        
-        for i, (name, cost) in enumerate(nodes_cost):
-            partition_map[curr_rank].append(name)
-            curr_sum += cost
-            
-            if curr_rank < self.devices - 1:
-                nodes_left = len(nodes_cost) - (i + 1)
-                ranks_left = (self.devices - 1) - curr_rank
-                
-                must_switch = (nodes_left <= ranks_left)
-                greedy_switch = (curr_sum >= avg_cost)
-                
-                if must_switch or (greedy_switch and nodes_left > ranks_left):
-                    curr_rank += 1
-                    curr_sum = 0.0
-            
-        return partition_map
+    def get_partition_plan(self, enable_coarsening=True, model_arch='cnn'):
+        if not enable_coarsening: return DPPartitioner(self._build(), self.devices).solve()
+        coarsener = Coarsener(self._build(), self.profile_data, model_arch)
+        return DPPartitioner(coarsener.coarsen(self.devices*10, self.devices), self.devices).solve()
