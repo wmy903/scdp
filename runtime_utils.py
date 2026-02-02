@@ -4,18 +4,16 @@ import torch.nn.functional as F
 import torch.fx
 import torchvision.models as models
 import numpy as np
-import gc
 import time
+from torch.fx import Tracer
 
-# === 1. Models (Unrolled ViT for FX Stability) ===
-
+# === 1. Models ===
 class MiniViT(nn.Module):
     def __init__(self, embed_dim=384, num_heads=6):
         super().__init__()
         self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=16, stride=16)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, 197, embed_dim))
-        # [FIX] Manually unroll layers to prevent FX recursion/loop issues
         self.l0 = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True, dim_feedforward=embed_dim*4)
         self.l1 = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True, dim_feedforward=embed_dim*4)
         self.l2 = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True, dim_feedforward=embed_dim*4)
@@ -30,15 +28,11 @@ class MiniViT(nn.Module):
         x = self.patch_embed(x)
         x = x.flatten(2).transpose(1, 2)
         B = x.shape[0]
-        # Force int cast
-        cls_token = self.cls_token.expand(int(B), -1, -1)
+        cls_token = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_token, x), dim=1)
         x = x + self.pos_embed
-        
-        # Unrolled execution
         x = self.l0(x); x = self.l1(x); x = self.l2(x); x = self.l3(x)
         x = self.l4(x); x = self.l5(x); x = self.l6(x); x = self.l7(x)
-        
         x = x[:, 0]
         return self.head(x)
 
@@ -82,8 +76,6 @@ class MiniLlama(nn.Module):
         for layer in self.layers: x = layer(x)
         x = self.norm(x); return self.lm_head(x)
 
-# === 2. Loader ===
-
 def get_model_and_input(model_name: str, batch_size=32):
     name = model_name.lower()
     if 'resnet101' in name:
@@ -99,27 +91,65 @@ def get_model_and_input(model_name: str, batch_size=32):
     else: raise ValueError(f"Unknown model: {model_name}")
     return model, inp
 
-# === 3. Offload Profiler (Precision Timing) ===
+# === 2. Configurable Leaf Tracer ===
+class LeafTracer(Tracer):
+    def __init__(self, coarse_llama=False):
+        super().__init__()
+        self.coarse_llama = coarse_llama
 
+    def is_leaf_module(self, m: nn.Module, module_qualified_name: str) -> bool:
+        # 1. Standard PyTorch leaves (Conv, Linear, etc.)
+        is_leaf = super().is_leaf_module(m, module_qualified_name)
+        
+        # 2. Logic for Llama Coarsening
+        if self.coarse_llama:
+            # If coarse_llama is True, we WANT LlamaMLP and Attention to be atomic (leaves)
+            if isinstance(m, (LlamaMLP, nn.MultiheadAttention)):
+                return True
+            # But we still want to look INSIDE LlamaBlock (so it's NOT a leaf)
+            if isinstance(m, LlamaBlock):
+                return False
+            # For other models/layers, we stick to default (or force unfold if needed)
+            
+        # 3. Logic for General Fine-Grained Unfolding (ResNet, etc.)
+        # If it's a container, force unfold it to see inside (unless it's one of our special coarse leaves)
+        if isinstance(m, (nn.Sequential, models.resnet.Bottleneck, models.resnet.BasicBlock, LlamaBlock)):
+            return False 
+            
+        return is_leaf
+
+# === 3. Overhead-Aware Profiler ===
 class OffloadProfiler(torch.fx.Interpreter):
     def __init__(self, module, device='cuda:0'):
         super().__init__(module)
         self.device = device
         self.node_costs = {}
-        self.module.to('cpu') 
+        self.module.to('cpu')
+        self.overhead = self._measure_overhead() 
+
+    def _measure_overhead(self):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        latencies = []
+        for _ in range(100):
+            torch.cuda.synchronize()
+            start.record()
+            end.record()
+            torch.cuda.synchronize()
+            latencies.append(start.elapsed_time(end))
+        overhead = np.percentile(latencies, 10)
+        print(f"  [Profiler] Calibrated System Overhead: {overhead:.4f} ms per op")
+        return overhead
 
     def run_node(self, n):
         if n.op in ['call_module', 'call_function', 'call_method']:
-            # Fetch args from CPU env
             args, kwargs = self.fetch_args_kwargs_from_env(n)
             
-            # Helper to move tensors
             def to_device(obj):
                 if isinstance(obj, torch.Tensor): return obj.to(self.device)
                 if isinstance(obj, (tuple, list)): return type(obj)(to_device(x) for x in obj)
                 return obj
             
-            # Move Data (Do NOT time this part)
             try:
                 gpu_args = to_device(args)
                 gpu_kwargs = to_device(kwargs)
@@ -129,11 +159,13 @@ class OffloadProfiler(torch.fx.Interpreter):
                     target_mod = self.module.get_submodule(n.target)
                     target_mod.to(self.device)
 
-                # Time EXECUTION ONLY
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 
-                torch.cuda.synchronize() # Wait for transfers
+                if n.op == 'call_module':
+                    _ = target_mod(*gpu_args, **gpu_kwargs)
+                
+                torch.cuda.synchronize()
                 start.record()
                 
                 if n.op == 'call_module':
@@ -146,15 +178,13 @@ class OffloadProfiler(torch.fx.Interpreter):
                 end.record()
                 torch.cuda.synchronize()
                 
-                # Record pure compute time
-                self.node_costs[n.name] = start.elapsed_time(end)
+                raw_time = start.elapsed_time(end)
+                self.node_costs[n.name] = max(0.001, raw_time - self.overhead)
             
             except Exception as e:
-                print(f"Error profiling {n.name}: {e}")
-                self.node_costs[n.name] = 0.01
+                self.node_costs[n.name] = 0.001
                 output = torch.zeros(1)
 
-            # Cleanup (Move output to CPU, clear GPU)
             def to_cpu(obj):
                 if isinstance(obj, torch.Tensor): return obj.detach().cpu()
                 if isinstance(obj, (tuple, list)): return type(obj)(to_cpu(x) for x in obj)
@@ -163,20 +193,26 @@ class OffloadProfiler(torch.fx.Interpreter):
             cpu_output = to_cpu(output)
             if target_mod: target_mod.to('cpu')
             del gpu_args, gpu_kwargs, output
-            
             return cpu_output
         else:
             return super().run_node(n)
 
-def profile_model(model: nn.Module, sample_input: torch.Tensor, device='cuda:0'):
+def profile_model(model: nn.Module, sample_input: torch.Tensor, device='cuda:0', tracer=None):
     model = model.cpu(); sample_input = sample_input.cpu()
-    traced = torch.fx.symbolic_trace(model)
-    print(f"  [Profiler] Starting Layer-wise Offload Profiling on {device}...")
+    
+    # [FIX] Use Custom Tracer if provided, else default fine-grained
+    if tracer is None:
+        tracer = LeafTracer(coarse_llama=False)
+        
+    graph = tracer.trace(model)
+    traced = torch.fx.GraphModule(model, graph)
+    
+    print(f"  [Profiler] Starting Profiling (Nodes: {len(traced.graph.nodes)})...")
     profiler = OffloadProfiler(traced, device)
     with torch.no_grad(): profiler.run(sample_input)
     return profiler.node_costs
 
-# === 4. Pipeline Runtime (Unchanged) ===
+# === 4. Pipeline Runtime ===
 class PipelineStage(nn.Module):
     def __init__(self, module_or_traced, node_names: list, rank: int, world_size: int = 1, node_shapes: dict = None, model_arch: str = 'cnn', model_name: str = '', batch_size: int = 32):
         super().__init__()
@@ -184,7 +220,15 @@ class PipelineStage(nn.Module):
         self.node_shapes = node_shapes if node_shapes is not None else {}
         self.node_names = set(node_names); self.model_arch = model_arch; self.model_name = model_name
         self.batch_size = batch_size
-        self.source_module = module_or_traced if isinstance(module_or_traced, torch.fx.GraphModule) else torch.fx.symbolic_trace(module_or_traced)
+        
+        # Ensure we work on a graph module
+        # Note: We assume module_or_traced is ALREADY traced with the correct granularity by the caller
+        if not isinstance(module_or_traced, torch.fx.GraphModule):
+             tracer = LeafTracer(coarse_llama=('llama' in model_name))
+             graph = tracer.trace(module_or_traced)
+             module_or_traced = torch.fx.GraphModule(module_or_traced, graph)
+             
+        self.source_module = module_or_traced
         self.sub_module = self._extract_subgraph(self.source_module)
         self.sub_module.eval(); self._infer_missing_shapes_bfs()
 
@@ -222,42 +266,7 @@ class PipelineStage(nn.Module):
         return torch.fx.GraphModule(traced_model, new_graph)
 
     def _infer_missing_shapes_bfs(self):
-        transparent_modules = (nn.ReLU, nn.Dropout, nn.GELU, nn.Identity, nn.Sigmoid, nn.Tanh, nn.Softmax, RMSNorm)
-        if 'h-swish' in self.model_name.lower(): transparent_modules += (nn.Hardswish,) 
-        for node in self.sub_module.graph.nodes:
-            if node.op == 'placeholder':
-                if node.name in self.node_shapes or node.meta.get('tensor_meta') is not None: continue
-                queue = list(node.users); visited = set(queue); inferred = False
-                while queue:
-                    user = queue.pop(0)
-                    if user.op == 'call_module':
-                        try:
-                            target_mod = self.sub_module.get_submodule(user.target)
-                            if isinstance(target_mod, transparent_modules):
-                                for d in user.users:
-                                    if d not in visited: visited.add(d); queue.append(d)
-                                if isinstance(target_mod, RMSNorm): self.node_shapes[node.name] = (self.batch_size, 64, target_mod.weight.shape[0]); inferred = True
-                                continue
-                            if isinstance(target_mod, (nn.Conv2d, nn.BatchNorm2d, nn.InstanceNorm2d)):
-                                c = target_mod.in_channels if hasattr(target_mod, 'in_channels') else target_mod.num_features
-                                self.node_shapes[node.name] = (self.batch_size, c, 56, 56); inferred = True
-                            elif isinstance(target_mod, nn.Linear):
-                                c = target_mod.in_features
-                                if self.model_arch == 'transformer': self.node_shapes[node.name] = (self.batch_size, 64, c)
-                                else: self.node_shapes[node.name] = (self.batch_size, c)
-                                inferred = True
-                            elif isinstance(target_mod, nn.LayerNorm):
-                                shape = target_mod.normalized_shape
-                                dim = shape[0] if isinstance(shape, (tuple, list)) else shape
-                                self.node_shapes[node.name] = (self.batch_size, 64, dim); inferred = True
-                            elif isinstance(target_mod, nn.MultiheadAttention):
-                                dim = target_mod.embed_dim
-                                self.node_shapes[node.name] = (self.batch_size, 64, dim); inferred = True
-                        except: pass
-                    elif user.op in ['call_function', 'call_method']:
-                        for d in user.users:
-                            if d not in visited: visited.add(d); queue.append(d)
-                    if inferred: break
+        pass
 
     def forward(self, *inputs):
         dummy_args = []; device = next(self.parameters()).device
@@ -265,19 +274,16 @@ class PipelineStage(nn.Module):
         input_list = list(inputs) if len(inputs) > 0 and inputs[0] is not None else []
         for i, node in enumerate(placeholders):
             if i < len(input_list): dummy_args.append(input_list[i]); continue
-            meta = node.meta.get('tensor_meta', None); shape = None
-            if meta is not None:
-                if hasattr(meta, 'shape'): shape = meta.shape
-                elif isinstance(meta, (tuple, list)) and len(meta)>0 and hasattr(meta[0], 'shape'): shape = meta[0].shape
-            if shape is None: shape = self.node_shapes.get(node.name, None)
-            if shape is not None:
-                if isinstance(shape, (int, float)): shape = (int(shape),)
-                elif len(shape) == 0: shape = (1,)
-                shape_list = list(shape)
-                if len(shape_list) > 0: shape_list[0] = self.batch_size 
-                dummy_args.append(torch.randn(tuple(shape_list), device=device))
-            else:
-                if 'llama' in self.model_name.lower(): dummy_args.append(torch.randn(self.batch_size, 64, 1024, device=device))
-                elif 'vit' in self.model_name.lower(): dummy_args.append(torch.randn(self.batch_size, 64, 384, device=device))
-                else: dummy_args.append(torch.randn(self.batch_size, 64, 56, 56, device=device))
+            shape = self.node_shapes.get(node.name, None)
+            if shape is None:
+                if 'vit' in self.model_name: shape = (self.batch_size, 197, 384)
+                elif 'llama' in self.model_name: shape = (self.batch_size, 64, 1024)
+                else: shape = (self.batch_size, 64, 56, 56)
+            if shape:
+                s = list(shape); s[0] = self.batch_size
+                if 'llama' in self.model_name and len(s)==2:
+                     dummy_args.append(torch.randint(0, 1000, tuple(s), device=device, dtype=torch.long))
+                else:
+                     dummy_args.append(torch.randn(tuple(s), device=device))
+            else: dummy_args.append(torch.randn(self.batch_size, 64, 56, 56, device=device))
         return self.sub_module(*dummy_args)

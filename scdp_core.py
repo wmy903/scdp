@@ -38,11 +38,15 @@ class Coarsener:
     def __init__(self, graph, profile, model_arch='cnn'):
         self.graph = graph; self.profile = profile; self.model_arch = model_arch
         self.total = sum(n.compute_cost for n in graph.nodes.values())
-    def coarsen(self, max_nodes=60, k_stages=4):
-        curr = copy.deepcopy(self.graph); ideal = self.total / k_stages
-        limit = ideal * 0.95 if self.model_arch == 'transformer' else ideal * 1.5 
+    
+    def coarsen(self, max_nodes=60, k_stages=4, force_no_limit=False):
+        curr = copy.deepcopy(self.graph)
+        if force_no_limit: limit = -1.0 
+        else:
+            ideal = self.total / k_stages
+            limit = ideal * 0.95 if self.model_arch == 'transformer' else ideal * 1.5 
         changed = True
-        while changed:
+        while changed and limit > 0:
             changed = False
             try:
                 g = nx.DiGraph(); 
@@ -68,10 +72,15 @@ class Coarsener:
             merged = False
             for e in cands:
                 if e.u not in curr.nodes or e.v not in curr.nodes: continue
-                if (curr.nodes[e.u].compute_cost + curr.nodes[e.v].compute_cost) < limit:
+                should_merge = False
+                cost_sum = curr.nodes[e.u].compute_cost + curr.nodes[e.v].compute_cost
+                if limit > 0 and cost_sum < limit: should_merge = True
+                elif limit < 0: should_merge = True 
+                if should_merge:
                     self._merge(curr, e.u, e.v); merged = True; break
             if not merged: break
         return curr
+
     def _merge(self, g, u, v):
         un, vn = g.nodes[u], g.nodes[v]
         un.compute_cost += vn.compute_cost; un.contained_names.extend(vn.contained_names)
@@ -117,6 +126,39 @@ class DPPartitioner:
             for idx in range(prev, curr): plan[k-1].extend(nodes[idx].contained_names)
             curr = prev
         return plan, stats
+
+# === 改进：均匀分割算法 ===
+class UniformPartitioner:
+    def __init__(self, m, p, d):
+        self.nodes=[n.name for n in m.graph.nodes if n.op in ['call_module','call_function','call_method']]
+        self.costs=[p.get(n,0.0) for n in self.nodes]; self.d=d
+
+    def solve(self):
+        total_cost = sum(self.costs)
+        target = total_cost / self.d
+        plan = {i: [] for i in range(self.d)}
+        stage = 0
+        current_stage_cost = 0.0
+        
+        for n, c in zip(self.nodes, self.costs):
+            # 只有当：1. 还没到最后一个 stage
+            # 2. 加上当前节点后的总和 超过了 target
+            # 3. 且 加上后的误差 比 仅仅保留现在的误差 更大（说明应该切了）
+            # 才进行切分
+            if stage < self.d - 1:
+                cost_with_node = current_stage_cost + c
+                if cost_with_node > target:
+                    # 比较：是在这里切（归入下一级），还是加进去再切？
+                    diff_exclude = abs(current_stage_cost - target)
+                    diff_include = abs(cost_with_node - target)
+                    if diff_include > diff_exclude and current_stage_cost > 0:
+                        stage += 1
+                        current_stage_cost = 0.0
+            
+            plan[stage].append(n)
+            current_stage_cost += c
+            
+        return plan, None
 
 class AdapipePartitioner:
     def __init__(self, m, p, d):
@@ -173,7 +215,6 @@ class GraphPartitioner:
         g=AlgoGraph(); valid=['call_module','call_function','call_method']
         for n in self.traced.graph.nodes:
             if n.op in valid:
-                # [Fix] No scaling needed, profile data is already correct
                 g.add_node(AlgoNode(n.name, compute_cost=self.profile_data.get(n.name,0.0)))
         for n in self.traced.graph.nodes:
             if n.op in valid:
